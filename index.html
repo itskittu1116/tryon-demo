@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Virtual Try-On Demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #fff;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { max-width: 100%; max-height: 100%; background: #000; }
+  canvas.mirror { transform: scaleX(-1); }
+  #video { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  #status { position: fixed; top: 8px; left: 8px; right: 8px; text-align: center;
+    font-size: 14px; text-shadow: 0 0 4px #000, 0 0 8px #000; z-index: 5; }
+  #ui { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 8px 14px; display: none;
+    gap: 8px; flex-wrap: wrap; justify-content: center;
+    background: linear-gradient(transparent, rgba(0,0,0,.75)); z-index: 5; }
+  button, label.btn { background: rgba(255,255,255,.16); color: #fff; border: 1px solid rgba(255,255,255,.35);
+    border-radius: 12px; padding: 12px 14px; font-size: 16px; min-width: 48px; cursor: pointer;
+    -webkit-tap-highlight-color: transparent; }
+  button:active, label.btn:active { background: rgba(255,255,255,.35); }
+  #start { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    font-size: 20px; padding: 18px 28px; background: #2e7d32; border-color: #2e7d32; z-index: 6; }
+  #hint { position: fixed; top: 38%; left: 16px; right: 16px; text-align: center; font-size: 15px;
+    line-height: 1.5; color: #ddd; z-index: 6; }
+  input[type=file] { display: none; }
+</style>
+</head>
+<body>
+  <div id="stage"><canvas id="canvas" width="720" height="1280"></canvas></div>
+  <video id="video" playsinline muted autoplay></video>
+
+  <div id="status"></div>
+  <div id="hint">Phone ko stand ya deewar se tikao, 1.5-2 meter door khade ho.<br>
+    Poora upper body (kandhe se kamar tak) dikhna chahiye.</div>
+  <button id="start">▶ Start Try-On</button>
+
+  <div id="ui">
+    <button id="prev">◀ Pichli</button>
+    <button id="next">Agli ▶</button>
+    <button id="bigger">＋ Bada</button>
+    <button id="smaller">－ Chhota</button>
+    <button id="up">↑ Upar</button>
+    <button id="down">↓ Neeche</button>
+    <label class="btn" for="file">🖼 Meri shirt</label>
+    <input id="file" type="file" accept="image/png,image/webp">
+    <button id="flip">🔄 Camera</button>
+    <button id="snap">📷 Photo</button>
+  </div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+
+const $ = (id) => document.getElementById(id);
+const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d");
+const statusEl = $("status");
+const setStatus = (t) => { statusEl.textContent = t; };
+
+let landmarker = null, stream = null, facing = "user", running = false;
+let idx = 0, widthScale = 2.0, yOff = 0.04, smooth = null;
+const HEIGHT_SCALE = 1.25, SMOOTH = 0.55;
+
+// ---------- test shirts (code se bani hui) ----------
+const SHIRT_POINTS = [[150,0],[220,0],[300,60],[380,0],[450,0],[600,150],[520,230],
+  [450,170],[450,600],[150,600],[150,170],[80,230],[0,150]];
+function makeShirt(color) {
+  const c = document.createElement("canvas");
+  c.width = c.height = 600;
+  const g = c.getContext("2d");
+  g.fillStyle = color;
+  g.beginPath();
+  SHIRT_POINTS.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y)));
+  g.closePath();
+  g.fill();
+  return c;
+}
+const shirts = [
+  { name: "Red",   img: makeShirt("#dc2828") },
+  { name: "Blue",  img: makeShirt("#1e78dc") },
+  { name: "Green", img: makeShirt("#3caa3c") },
+  { name: "Black", img: makeShirt("#2d2d2d") },
+];
+
+// ---------- camera ----------
+async function startCamera() {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  canvas.classList.toggle("mirror", facing === "user");
+}
+
+// ---------- AI model ----------
+async function initModel() {
+  const vision = await FilesetResolver.forVisionTasks(WASM);
+  const opts = (delegate) => ({
+    baseOptions: { modelAssetPath: MODEL, delegate },
+    runningMode: "VIDEO",
+    numPoses: 1,
+  });
+  try {
+    landmarker = await PoseLandmarker.createFromOptions(vision, opts("GPU"));
+  } catch (e) {
+    landmarker = await PoseLandmarker.createFromOptions(vision, opts("CPU"));
+  }
+}
+
+// ---------- shirt drawing ----------
+function drawShirt(lm) {
+  const W = canvas.width, H = canvas.height;
+  const need = [11, 12, 23, 24];
+  if (!lm || need.some((i) => (lm[i].visibility ?? 1) < 0.5)) {
+    setStatus(lm ? "Poora upper body dikhna chahiye - phone thoda door rakho"
+                 : "Kisi ko camera ke saamne khada karo");
+    smooth = null;
+    return;
+  }
+  let a = { x: lm[11].x * W, y: lm[11].y * H };
+  let b = { x: lm[12].x * W, y: lm[12].y * H };
+  if (a.x > b.x) [a, b] = [b, a];
+  const hx = ((lm[23].x + lm[24].x) / 2) * W;
+  const hy = ((lm[23].y + lm[24].y) / 2) * H;
+
+  const cur = [a.x, a.y, b.x, b.y, hx, hy];
+  smooth = smooth ? smooth.map((v, i) => SMOOTH * v + (1 - SMOOTH) * cur[i]) : cur;
+  const [ax, ay, bx, by, px, py] = smooth;
+
+  const shoulder = Math.hypot(bx - ax, by - ay);
+  const mx = (ax + bx) / 2, my = (ay + by) / 2;
+  const torso = Math.hypot(px - mx, py - my);
+  if (shoulder < 20 || torso < 20) return;
+
+  const angle = Math.atan2(by - ay, bx - ax);
+  const img = shirts[idx].img;
+  const iw = img.width, ih = img.height;
+
+  ctx.save();
+  ctx.translate(mx, my - torso * yOff);
+  ctx.rotate(angle);
+  ctx.scale((shoulder * widthScale) / iw, (torso * HEIGHT_SCALE) / ih);
+  ctx.drawImage(img, -iw / 2, 0);
+  ctx.restore();
+  setStatus("Shirt: " + shirts[idx].name);
+}
+
+// ---------- main loop ----------
+let lastTs = -1;
+function loop() {
+  if (!running) return;
+  if (video.readyState >= 2) {
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const ts = performance.now();
+    if (ts !== lastTs) {
+      lastTs = ts;
+      let lm = null;
+      try {
+        const res = landmarker.detectForVideo(video, ts);
+        lm = res.landmarks && res.landmarks[0];
+      } catch (e) { /* ek frame skip */ }
+      drawShirt(lm);
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+// ---------- buttons ----------
+$("start").addEventListener("click", async () => {
+  $("start").style.display = "none";
+  $("hint").style.display = "none";
+  try {
+    if (!window.isSecureContext) {
+      throw new Error("Ye page https link se kholo (file se nahi)");
+    }
+    setStatus("Camera khul raha hai...");
+    await startCamera();
+    setStatus("AI model load ho raha hai (pehli baar thoda time lagega)...");
+    await initModel();
+    $("ui").style.display = "flex";
+    running = true;
+    loop();
+  } catch (e) {
+    setStatus("Error: " + (e.message || e) + " - page reload karke Allow dabao");
+    $("start").style.display = "block";
+  }
+});
+
+$("next").addEventListener("click", () => { idx = (idx + 1) % shirts.length; });
+$("prev").addEventListener("click", () => { idx = (idx - 1 + shirts.length) % shirts.length; });
+$("bigger").addEventListener("click", () => { widthScale += 0.1; });
+$("smaller").addEventListener("click", () => { widthScale = Math.max(0.5, widthScale - 0.1); });
+$("up").addEventListener("click", () => { yOff += 0.02; });
+$("down").addEventListener("click", () => { yOff -= 0.02; });
+
+$("flip").addEventListener("click", async () => {
+  running = false;
+  facing = facing === "user" ? "environment" : "user";
+  smooth = null;
+  try {
+    await startCamera();
+  } catch (e) {
+    setStatus("Camera badalna fail: " + (e.message || e));
+  }
+  running = true;
+  loop();
+});
+
+$("file").addEventListener("change", (ev) => {
+  const f = ev.target.files && ev.target.files[0];
+  if (!f) return;
+  const img = new Image();
+  img.onload = () => {
+    shirts.push({ name: f.name, img });
+    idx = shirts.length - 1;
+  };
+  img.src = URL.createObjectURL(f);
+  ev.target.value = "";
+});
+
+$("snap").addEventListener("click", () => {
+  const out = document.createElement("canvas");
+  out.width = canvas.width;
+  out.height = canvas.height;
+  const g = out.getContext("2d");
+  if (facing === "user") { g.translate(out.width, 0); g.scale(-1, 1); }
+  g.drawImage(canvas, 0, 0);
+  out.toBlob((blob) => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "tryon_" + Date.now() + ".png";
+    a.click();
+  }, "image/png");
+});
+</script>
+</body>
+</html>
