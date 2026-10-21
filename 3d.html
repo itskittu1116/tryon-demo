@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Virtual Try-On 3D Demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #fff;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #wrap { position: relative; width: 360px; height: 640px; background: #000; overflow: hidden; }
+  #wrap.mirror { transform: scaleX(-1); }
+  #video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; }
+  #gl { position: absolute; inset: 0; }
+  #gl canvas { display: block; }
+  #status { position: fixed; top: 8px; left: 8px; right: 8px; text-align: center;
+    font-size: 14px; text-shadow: 0 0 4px #000, 0 0 8px #000; z-index: 5; }
+  #ui { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 6px 12px; display: none;
+    gap: 6px; flex-wrap: wrap; justify-content: center;
+    background: linear-gradient(transparent, rgba(0,0,0,.78)); z-index: 5; }
+  button, label.btn { background: rgba(255,255,255,.16); color: #fff; border: 1px solid rgba(255,255,255,.35);
+    border-radius: 12px; padding: 10px 11px; font-size: 14px; cursor: pointer;
+    -webkit-tap-highlight-color: transparent; }
+  button:active, label.btn:active { background: rgba(255,255,255,.35); }
+  #start { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    font-size: 20px; padding: 18px 28px; background: #2e7d32; border-color: #2e7d32; z-index: 6; }
+  #hint { position: fixed; top: 36%; left: 16px; right: 16px; text-align: center; font-size: 15px;
+    line-height: 1.5; color: #ddd; z-index: 6; }
+  input[type=file] { display: none; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+  <div id="stage">
+    <div id="wrap">
+      <video id="video" playsinline muted autoplay></video>
+      <div id="gl"></div>
+    </div>
+  </div>
+
+  <div id="status"></div>
+  <div id="hint">Phone ko stand ya deewar se tikao, 1.5-2 meter door khade ho.<br>
+    Poora upper body (kandhe se kamar tak) dikhna chahiye.<br>
+    Thoda ghumo - shirt bhi 3D mein ghumegi.</div>
+  <button id="start">▶ Start 3D Try-On</button>
+
+  <div id="ui">
+    <button id="prev">◀ Pichli</button>
+    <button id="next">Agli ▶</button>
+    <button id="bigger">＋ Bada</button>
+    <button id="smaller">－ Chhota</button>
+    <button id="up">↑ Upar</button>
+    <button id="down">↓ Neeche</button>
+    <button id="yaw">🔁 Ghumna ulta</button>
+    <label class="btn" for="glb">🧥 3D shirt (.glb)</label>
+    <input id="glb" type="file" accept=".glb,.gltf">
+    <button id="turn">↻ Model 180°</button>
+    <label class="btn" for="pat">🖼 Pattern</label>
+    <input id="pat" type="file" accept="image/*">
+    <button id="flip">🔄 Camera</button>
+    <button id="snap">📷 Photo</button>
+  </div>
+
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+
+const $ = (id) => document.getElementById(id);
+const video = $("video"), wrap = $("wrap"), glDiv = $("gl"), statusEl = $("status");
+const setStatus = (t) => { statusEl.textContent = t; };
+
+// ---------- state ----------
+let landmarker = null, stream = null, facing = "user";
+let vw = 720, vh = 1280;                 // video size (pixels)
+let idx = 0;
+let widthScale = 1.15, heightScale = 1.15, yOff = 0.03;
+let invertYaw = false;
+const YAW_GAIN = 1.0, SMOOTH = 0.5, GLB_W = 1.5;
+let smooth = null, yawS = 0;
+let swayX = 0, swayV = 0, swayTarget = 0, lastDet = 0, lastPos = null;
+let customHolder = null, customActive = false;
+let loopId = 0;
+
+// ---------- three.js setup ----------
+const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setClearColor(0x000000, 0);
+glDiv.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-360, 360, 640, -640, 1, 4000);
+camera.position.z = 1500;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8890a0, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 1.7);
+sun.position.set(0.3, 0.9, 1.0);
+scene.add(sun);
+
+function layout() {
+  const s = Math.min(window.innerWidth / vw, window.innerHeight / vh);
+  const w = Math.floor(vw * s), h = Math.floor(vh * s);
+  wrap.style.width = w + "px";
+  wrap.style.height = h + "px";
+  renderer.setSize(w, h);
+  camera.left = -vw / 2; camera.right = vw / 2;
+  camera.top = vh / 2;   camera.bottom = -vh / 2;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener("resize", layout);
+layout();
+
+// ---------- materials (colours + patterns) ----------
+function canvasTex(draw, rx, ry) {
+  const c = document.createElement("canvas");
+  c.width = c.height = 256;
+  draw(c.getContext("2d"));
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(rx, ry);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+const defs = [
+  { name: "Red",   color: 0xdc2828 },
+  { name: "Blue",  color: 0x1e78dc },
+  { name: "Green", color: 0x3caa3c },
+  { name: "Black", color: 0x2d2d2d },
+  { name: "White", color: 0xf2f2f2 },
+  { name: "Stripes", map: canvasTex((g) => {
+      g.fillStyle = "#f5f5f5"; g.fillRect(0, 0, 256, 256);
+      g.fillStyle = "#1e50b4";
+      for (let y = 0; y < 256; y += 64) g.fillRect(0, y, 256, 32);
+    }, 1, 4) },
+  { name: "Check", map: canvasTex((g) => {
+      g.fillStyle = "#b42828"; g.fillRect(0, 0, 256, 256);
+      g.fillStyle = "rgba(255,255,255,0.55)";
+      for (let i = 0; i < 256; i += 64) { g.fillRect(i, 0, 24, 256); g.fillRect(0, i, 256, 24); }
+    }, 4, 4) },
+];
+const mats = defs.map((d) => new THREE.MeshStandardMaterial({
+  color: d.map ? 0xffffff : d.color, map: d.map || null,
+  roughness: 0.85, metalness: 0.0, side: THREE.DoubleSide,
+}));
+
+// ---------- procedural 3D shirt ----------
+// Units: shirt chaudai (kandhe se kandhe) = 1. Body ki height 1 = gala se hem tak (scale.y se set hoti hai).
+const KEYS = [
+  { y:  0.02, rx: 0.15, rz: 0.12, drop: 0.0  },  // gala
+  { y:  0.00, rx: 0.50, rz: 0.20, drop: 0.05 },  // kandhe
+  { y: -0.15, rx: 0.50, rz: 0.27, drop: 0.0  },  // seena
+  { y: -0.40, rx: 0.47, rz: 0.26, drop: 0.0  },
+  { y: -0.70, rx: 0.47, rz: 0.26, drop: 0.0  },
+  { y: -1.00, rx: 0.49, rz: 0.27, drop: 0.0  },  // hem
+];
+function lerpRow(a, b, t) {
+  const l = (p, q) => p + (q - p) * t;
+  return { y: l(a.y, b.y), rx: l(a.rx, b.rx), rz: l(a.rz, b.rz), drop: l(a.drop, b.drop) };
+}
+function densify(keys, sub) {
+  const out = [];
+  for (let k = 0; k < keys.length - 1; k++)
+    for (let s = 0; s < sub; s++) out.push(lerpRow(keys[k], keys[k + 1], s / sub));
+  out.push({ ...keys[keys.length - 1] });
+  return out;
+}
+const rows = densify(KEYS, 3);
+const R = 40;
+const nVert = rows.length * (R + 1);
+const posArr = new Float32Array(nVert * 3);
+const uvArr = new Float32Array(nVert * 2);
+const rowW = rows.map((r) => Math.pow(Math.max(0, -r.y), 1.4));   // hem par zyada hilega
+rows.forEach((r, j) => {
+  for (let i = 0; i <= R; i++) {
+    const th = (i / R) * Math.PI * 2, c = Math.cos(th), s = Math.sin(th);
+    const k = j * (R + 1) + i;
+    posArr[k * 3] = c * r.rx;
+    posArr[k * 3 + 1] = r.y - r.drop * c * c;
+    posArr[k * 3 + 2] = s * r.rz;
+    uvArr[k * 2] = i / R;
+    uvArr[k * 2 + 1] = j / (rows.length - 1);
+  }
+});
+const basePos = new Float32Array(posArr);
+const index = [];
+for (let j = 0; j < rows.length - 1; j++) {
+  for (let i = 0; i < R; i++) {
+    const a = j * (R + 1) + i, b = a + 1, c = a + (R + 1), d = c + 1;
+    index.push(a, c, b, b, c, d);
+  }
+}
+const bodyGeo = new THREE.BufferGeometry();
+bodyGeo.setAttribute("position", new THREE.BufferAttribute(posArr, 3));
+bodyGeo.setAttribute("uv", new THREE.BufferAttribute(uvArr, 2));
+bodyGeo.setIndex(index);
+bodyGeo.computeVertexNormals();
+
+const body = new THREE.Mesh(bodyGeo, mats[0]);
+body.frustumCulled = false;
+
+function makeSleeve(side) {
+  const L = 0.34, rShoulder = 0.19, rEnd = 0.15, phi = 0.5;
+  const geo = new THREE.CylinderGeometry(rEnd, rShoulder, L, 20, 1, true);
+  const m = new THREE.Mesh(geo, mats[0]);
+  const d = new THREE.Vector3(side * Math.cos(phi), -Math.sin(phi), 0);
+  const start = new THREE.Vector3(side * 0.47, -0.05, 0);
+  m.position.copy(start).addScaledVector(d, L / 2);
+  m.rotation.z = side > 0 ? -(Math.PI / 2 + phi) : (Math.PI / 2 + phi);
+  m.scale.z = 0.85;
+  return m;
+}
+const sleeveR = makeSleeve(1), sleeveL = makeSleeve(-1);
+
+const collar = new THREE.Mesh(new THREE.TorusGeometry(0.15, 0.018, 8, 32), mats[0]);
+collar.rotation.x = Math.PI / 2;
+collar.scale.y = 0.8;
+collar.position.y = 0.02;
+body.add(collar);
+
+const proc = new THREE.Group();
+proc.add(body, sleeveR, sleeveL);
+
+const root = new THREE.Group();
+root.rotation.order = "ZYX";   // pehle yaw (Y), phir roll (Z)
+root.add(proc);
+root.visible = false;
+scene.add(root);
+
+function applyMaterial() {
+  const m = mats[idx];
+  body.material = m; sleeveR.material = m; sleeveL.material = m; collar.material = m;
+}
+
+// kapde jaisa halka hilna: hem body ki chaal se thoda peeche rehta hai
+function animateSway(dt, t) {
+  swayV += (60 * (swayTarget - swayX) - 7 * swayV) * dt;
+  swayX += swayV * dt;
+  swayX = Math.max(-0.35, Math.min(0.35, swayX));
+  if (!root.visible || !proc.visible) return;
+  const p = bodyGeo.attributes.position.array;
+  for (let j = 0; j < rows.length; j++) {
+    const w = rowW[j];
+    for (let i = 0; i <= R; i++) {
+      const k = (j * (R + 1) + i) * 3;
+      p[k]     = basePos[k] + swayX * w;
+      p[k + 1] = basePos[k + 1];
+      p[k + 2] = basePos[k + 2] + Math.sin(t * 2.2 + i * 0.5 + j * 0.6) * 0.007 * w;
+    }
+  }
+  bodyGeo.attributes.position.needsUpdate = true;
+  bodyGeo.computeVertexNormals();
+}
+
+// ---------- camera ----------
+async function startCamera() {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+  vw = video.videoWidth;
+  vh = video.videoHeight;
+  wrap.classList.toggle("mirror", facing === "user");
+  layout();
+}
+
+// ---------- AI model ----------
+async function initModel() {
+  const vision = await FilesetResolver.forVisionTasks(WASM);
+  const opts = (delegate) => ({
+    baseOptions: { modelAssetPath: MODEL, delegate },
+    runningMode: "VIDEO",
+    numPoses: 1,
+  });
+  try {
+    landmarker = await PoseLandmarker.createFromOptions(vision, opts("GPU"));
+  } catch (e) {
+    landmarker = await PoseLandmarker.createFromOptions(vision, opts("CPU"));
+  }
+}
+
+// ---------- tracking -> shirt ----------
+function handlePose(res, now) {
+  const lm = res && res.landmarks && res.landmarks[0];
+  const wl = res && res.worldLandmarks && res.worldLandmarks[0];
+  const need = [11, 12, 23, 24];
+  if (!lm || need.some((i) => (lm[i].visibility ?? 1) < 0.5)) {
+    root.visible = false;
+    smooth = null;
+    lastPos = null;
+    setStatus(lm ? "Poora upper body dikhna chahiye - phone door rakho"
+                 : "Kisi ko camera ke saamne khada karo");
+    return;
+  }
+
+  let ia = 11, ib = 12;
+  if (lm[11].x > lm[12].x) { ia = 12; ib = 11; }   // image ka left/right
+  const px = (l) => (l.x - 0.5) * vw;
+  const py = (l) => (0.5 - l.y) * vh;
+  const cur = [
+    px(lm[ia]), py(lm[ia]), px(lm[ib]), py(lm[ib]),
+    ((lm[23].x + lm[24].x) / 2 - 0.5) * vw,
+    (0.5 - (lm[23].y + lm[24].y) / 2) * vh,
+  ];
+  const first = smooth === null;
+  smooth = first ? cur : smooth.map((v, i) => SMOOTH * v + (1 - SMOOTH) * cur[i]);
+  const [ax, ay, bx, by, hx, hy] = smooth;
+
+  const sd = Math.hypot(bx - ax, by - ay);
+  const mx = (ax + bx) / 2, my = (ay + by) / 2;
+  const torso = Math.hypot(hx - mx, hy - my);
+  if (sd < 20 || torso < 20) return;
+
+  const roll = Math.atan2(by - ay, bx - ax);
+
+  // yaw: body kitni ghumi hai (3D world landmarks se)
+  let yawRaw = 0;
+  if (wl) {
+    const dz = wl[ib].z - wl[ia].z;
+    const dx = Math.max(Math.abs(wl[ib].x - wl[ia].x), 0.05);
+    yawRaw = Math.atan2(dz, dx) * YAW_GAIN * (invertYaw ? -1 : 1);
+    yawRaw = Math.max(-1.1, Math.min(1.1, yawRaw));
+  }
+  yawS = first ? yawRaw : 0.7 * yawS + 0.3 * yawRaw;
+
+  const sProc = sd * widthScale;
+  root.visible = true;
+  root.position.set(mx, my + torso * yOff, 0);
+  root.rotation.set(0, yawS, roll);
+  root.scale.setScalar(sProc * (customActive ? GLB_W : 1));
+  body.scale.y = (torso * heightScale) / sProc;
+
+  // hem ke hilne ke liye body ki speed
+  if (lastPos && now > lastDet) {
+    const vx = (mx - lastPos.x) / ((now - lastDet) / 1000);
+    swayTarget = Math.max(-0.3, Math.min(0.3, (-vx / sProc) * 0.12));
+  }
+  lastPos = { x: mx };
+  lastDet = now;
+
+  setStatus(customActive ? "3D model lagi hai" : "Shirt: " + defs[idx].name);
+}
+
+// ---------- main loop ----------
+function startLoop() {
+  const id = ++loopId;
+  let lastVT = -1, prev = performance.now();
+  const frame = (now) => {
+    if (id !== loopId) return;
+    const dt = Math.min(0.05, (now - prev) / 1000);
+    prev = now;
+    if (video.readyState >= 2 && video.currentTime !== lastVT) {
+      lastVT = video.currentTime;
+      let res = null;
+      try { res = landmarker.detectForVideo(video, now); } catch (e) { /* frame skip */ }
+      handlePose(res, now);
+    }
+    animateSway(dt, now / 1000);
+    renderer.render(scene, camera);
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+
+// ---------- buttons ----------
+function showProcedural() {
+  if (customHolder) customHolder.visible = false;
+  customActive = false;
+  proc.visible = true;
+  applyMaterial();
+}
+$("start").addEventListener("click", async () => {
+  $("start").style.display = "none";
+  $("hint").style.display = "none";
+  try {
+    if (!window.isSecureContext) throw new Error("Ye page https link se kholo");
+    setStatus("Camera khul raha hai...");
+    await startCamera();
+    setStatus("AI model load ho raha hai (pehli baar thoda time lagega)...");
+    await initModel();
+    $("ui").style.display = "flex";
+    applyMaterial();
+    startLoop();
+  } catch (e) {
+    setStatus("Error: " + (e.message || e) + " - page reload karke Allow dabao");
+    $("start").style.display = "block";
+  }
+});
+
+$("next").addEventListener("click", () => { idx = (idx + 1) % mats.length; showProcedural(); });
+$("prev").addEventListener("click", () => { idx = (idx - 1 + mats.length) % mats.length; showProcedural(); });
+$("bigger").addEventListener("click", () => { widthScale += 0.05; });
+$("smaller").addEventListener("click", () => { widthScale = Math.max(0.5, widthScale - 0.05); });
+$("up").addEventListener("click", () => { yOff += 0.02; });
+$("down").addEventListener("click", () => { yOff -= 0.02; });
+$("yaw").addEventListener("click", () => { invertYaw = !invertYaw; setStatus("Ghumna ulta: " + (invertYaw ? "ON" : "OFF")); });
+$("turn").addEventListener("click", () => { if (customHolder) customHolder.rotation.y += Math.PI; });
+
+$("flip").addEventListener("click", async () => {
+  loopId++;               // purana loop band
+  facing = facing === "user" ? "environment" : "user";
+  smooth = null;
+  try { await startCamera(); } catch (e) { setStatus("Camera badalna fail: " + (e.message || e)); }
+  startLoop();
+});
+
+// apna pattern (photo se kapde ka design)
+$("pat").addEventListener("change", (ev) => {
+  const f = ev.target.files && ev.target.files[0];
+  if (!f) return;
+  new THREE.TextureLoader().load(URL.createObjectURL(f), (tex) => {
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(2, 2);
+    mats.push(new THREE.MeshStandardMaterial({ color: 0xffffff, map: tex, roughness: 0.85, side: THREE.DoubleSide }));
+    defs.push({ name: f.name });
+    idx = mats.length - 1;
+    showProcedural();
+  });
+  ev.target.value = "";
+});
+
+// apna 3D shirt model (.glb)
+const gltfLoader = new GLTFLoader();
+$("glb").addEventListener("change", (ev) => {
+  const f = ev.target.files && ev.target.files[0];
+  if (!f) return;
+  setStatus("3D model load ho raha hai...");
+  gltfLoader.load(URL.createObjectURL(f), (gltf) => {
+    if (customHolder) root.remove(customHolder);
+    const m = gltf.scene;
+    const box = new THREE.Box3().setFromObject(m);
+    const size = new THREE.Vector3(), center = new THREE.Vector3();
+    box.getSize(size); box.getCenter(center);
+    m.position.set(-center.x, -box.max.y, -center.z);   // upar ka kinara kandhon par, beech mein
+    const holder = new THREE.Group();
+    holder.add(m);
+    holder.scale.setScalar(1 / Math.max(size.x, 1e-6));
+    root.add(holder);
+    customHolder = holder;
+    customActive = true;
+    proc.visible = false;
+    setStatus("3D model lagi hai (ulta ho toh Model 180° dabao)");
+  }, undefined, () => setStatus("Ye .glb load nahi hui (compressed ya galat file ho sakti hai)"));
+  ev.target.value = "";
+});
+
+$("snap").addEventListener("click", () => {
+  renderer.render(scene, camera);
+  const out = document.createElement("canvas");
+  out.width = vw; out.height = vh;
+  const g = out.getContext("2d");
+  if (facing === "user") { g.translate(vw, 0); g.scale(-1, 1); }
+  g.drawImage(video, 0, 0, vw, vh);
+  g.drawImage(renderer.domElement, 0, 0, vw, vh);
+  out.toBlob((blob) => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "tryon3d_" + Date.now() + ".png";
+    a.click();
+  }, "image/png");
+});
+</script>
+</body>
+</html>
